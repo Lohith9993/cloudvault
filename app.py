@@ -14,7 +14,7 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 def get_db():
     conn = sqlite3.connect('cloudvault.db')
     conn.row_factory = sqlite3.Row
-    return conn
+    conn = sqlite3.connect('/tmp/cloudvault.db')
 
 def init_db():
     conn = get_db()
