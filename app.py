@@ -17,7 +17,8 @@ def get_db():
     return conn
 
 def init_db():
-   conn = sqlite3.connect('/tmp/cloudvault.db')
+    conn = sqlite3.connect('/tmp/cloudvault.db')
+    conn.row_factory = sqlite3.Row
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
