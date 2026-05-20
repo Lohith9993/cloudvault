@@ -1,14 +1,72 @@
-from flask import Flask, request, jsonify, render_template, send_from_directory
-import os, uuid, datetime, mimetypes
+from flask import Flask, request, jsonify, render_template, send_from_directory, session
+from werkzeug.security import generate_password_hash, check_password_hash
+import os, datetime, mimetypes, sqlite3, uuid, functools
 
 app = Flask(__name__)
+app.secret_key = 'cloudvault-secret-key-change-in-production'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-def get_file_info(filename):
-    path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+# ─── DATABASE SETUP ────────────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect('cloudvault.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            size_bytes INTEGER,
+            mime_type TEXT,
+            share_token TEXT UNIQUE,
+            share_expires TEXT,
+            uploaded_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ─── AUTH HELPERS ───────────────────────────────────────────────────────────────
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Login required'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def current_user():
+    return session.get('user_id')
+
+# ─── FILE HELPERS ───────────────────────────────────────────────────────────────
+
+def user_upload_dir(user_id):
+    path = os.path.join(app.config['UPLOAD_FOLDER'], str(user_id))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def get_file_info(filename, user_id, row=None):
+    path = os.path.join(user_upload_dir(user_id), filename)
     if not os.path.exists(path):
         return None
     stat = os.stat(path)
@@ -22,36 +80,97 @@ def get_file_info(filename):
         size_str = f"{size/(1024*1024):.1f} MB"
     return {
         'name': filename,
+        'original_name': row['original_name'] if row else filename,
         'size': size_str,
         'size_bytes': size,
         'modified': datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%b %d, %Y %I:%M %p'),
         'type': mime or 'application/octet-stream',
-        'url': f'/file/{filename}'
+        'url': f'/file/{filename}',
+        'share_token': row['share_token'] if row else None
     }
+
+# ─── AUTH ROUTES ────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    if 'user_id' not in session:
+        return render_template('login.html')
+    return render_template('index.html', username=session.get('username'))
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username', '').strip()
+    email = data.get('email', '').strip()
+    password = data.get('password', '')
+    if not username or not email or not password:
+        return jsonify({'error': 'All fields required'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    hashed = generate_password_hash(password)
+    try:
+        conn = get_db()
+        conn.execute('INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+                     (username, email, hashed))
+        conn.commit()
+        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        conn.close()
+        return jsonify({'success': True, 'username': username})
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Username or email already exists'}), 409
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    conn = get_db()
+    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    conn.close()
+    if not user or not check_password_hash(user['password'], password):
+        return jsonify({'error': 'Invalid username or password'}), 401
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    return jsonify({'success': True, 'username': user['username']})
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True})
+
+@app.route('/api/me')
+@login_required
+def me():
+    return jsonify({'user_id': session['user_id'], 'username': session['username']})
+
+# ─── FILE ROUTES ────────────────────────────────────────────────────────────────
 
 @app.route('/api/files', methods=['GET'])
+@login_required
 def list_files():
     search = request.args.get('search', '').lower()
     filter_type = request.args.get('type', 'all')
+    uid = current_user()
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM files WHERE user_id = ? ORDER BY uploaded_at DESC', (uid,)).fetchall()
+    conn.close()
     files = []
-    for fname in os.listdir(app.config['UPLOAD_FOLDER']):
-        info = get_file_info(fname)
-        if info:
-            if search and search not in fname.lower():
-                continue
-            t = info['type']
-            if filter_type == 'image' and not t.startswith('image'):
-                continue
-            if filter_type == 'document' and not (t.startswith('text') or 'pdf' in t or 'word' in t or 'sheet' in t):
-                continue
-            if filter_type == 'video' and not t.startswith('video'):
-                continue
-            files.append(info)
-    files.sort(key=lambda x: x['modified'], reverse=True)
+    for row in rows:
+        info = get_file_info(row['filename'], uid, row)
+        if not info:
+            continue
+        if search and search not in row['original_name'].lower():
+            continue
+        t = info['type']
+        if filter_type == 'image' and not t.startswith('image'):
+            continue
+        if filter_type == 'document' and not (t.startswith('text') or 'pdf' in t or 'word' in t):
+            continue
+        if filter_type == 'video' and not t.startswith('video'):
+            continue
+        files.append(info)
     total_bytes = sum(f['size_bytes'] for f in files)
     return jsonify({
         'files': files,
@@ -60,58 +179,113 @@ def list_files():
     })
 
 @app.route('/api/upload', methods=['POST'])
+@login_required
 def upload():
     if 'files' not in request.files:
         return jsonify({'error': 'No files'}), 400
+    uid = current_user()
+    upload_dir = user_upload_dir(uid)
     uploaded = []
+    conn = get_db()
     for f in request.files.getlist('files'):
         if f.filename:
+            original_name = f.filename
             safe_name = f.filename.replace('/', '_').replace('..', '')
-            # Avoid duplicates
             base, ext = os.path.splitext(safe_name)
-            final_name = safe_name
-            counter = 1
-            while os.path.exists(os.path.join(app.config['UPLOAD_FOLDER'], final_name)):
-                final_name = f"{base}_{counter}{ext}"
-                counter += 1
-            f.save(os.path.join(app.config['UPLOAD_FOLDER'], final_name))
-            uploaded.append(get_file_info(final_name))
+            unique_name = f"{base}_{uuid.uuid4().hex[:8]}{ext}"
+            f.save(os.path.join(upload_dir, unique_name))
+            stat = os.stat(os.path.join(upload_dir, unique_name))
+            mime, _ = mimetypes.guess_type(unique_name)
+            conn.execute(
+                'INSERT INTO files (user_id, filename, original_name, size_bytes, mime_type) VALUES (?, ?, ?, ?, ?)',
+                (uid, unique_name, original_name, stat.st_size, mime)
+            )
+            conn.commit()
+            row = conn.execute('SELECT * FROM files WHERE filename = ?', (unique_name,)).fetchone()
+            uploaded.append(get_file_info(unique_name, uid, row))
+    conn.close()
     return jsonify({'uploaded': uploaded, 'count': len(uploaded)})
 
 @app.route('/api/delete/<filename>', methods=['DELETE'])
+@login_required
 def delete_file(filename):
-    path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    uid = current_user()
+    conn = get_db()
+    row = conn.execute('SELECT * FROM files WHERE filename = ? AND user_id = ?', (filename, uid)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'File not found'}), 404
+    path = os.path.join(user_upload_dir(uid), filename)
     if os.path.exists(path):
         os.remove(path)
-        return jsonify({'success': True})
-    return jsonify({'error': 'File not found'}), 404
+    conn.execute('DELETE FROM files WHERE filename = ? AND user_id = ?', (filename, uid))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
 
 @app.route('/api/rename', methods=['POST'])
+@login_required
 def rename_file():
     data = request.json
-    old = os.path.join(app.config['UPLOAD_FOLDER'], data['old_name'])
-    new = os.path.join(app.config['UPLOAD_FOLDER'], data['new_name'])
-    if os.path.exists(old):
-        os.rename(old, new)
-        return jsonify({'success': True, 'file': get_file_info(data['new_name'])})
-    return jsonify({'error': 'File not found'}), 404
+    uid = current_user()
+    conn = get_db()
+    row = conn.execute('SELECT * FROM files WHERE filename = ? AND user_id = ?',
+                       (data['filename'], uid)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'File not found'}), 404
+    conn.execute('UPDATE files SET original_name = ? WHERE filename = ? AND user_id = ?',
+                 (data['new_name'], data['filename'], uid))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+@app.route('/api/share/<filename>', methods=['POST'])
+@login_required
+def share_file(filename):
+    uid = current_user()
+    token = uuid.uuid4().hex
+    expires = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
+    conn = get_db()
+    conn.execute('UPDATE files SET share_token = ?, share_expires = ? WHERE filename = ? AND user_id = ?',
+                 (token, expires, filename, uid))
+    conn.commit()
+    conn.close()
+    return jsonify({'share_url': f'/shared/{token}', 'expires': expires})
+
+@app.route('/shared/<token>')
+def shared_file(token):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM files WHERE share_token = ?', (token,)).fetchone()
+    conn.close()
+    if not row:
+        return "File not found or link expired", 404
+    if datetime.datetime.fromisoformat(row['share_expires']) < datetime.datetime.now():
+        return "Share link has expired", 410
+    return send_from_directory(user_upload_dir(row['user_id']), row['filename'],
+                               download_name=row['original_name'])
 
 @app.route('/file/<filename>')
+@login_required
 def serve_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    uid = current_user()
+    return send_from_directory(user_upload_dir(uid), filename)
 
 @app.route('/api/stats')
+@login_required
 def stats():
-    files = [get_file_info(f) for f in os.listdir(app.config['UPLOAD_FOLDER'])]
-    files = [f for f in files if f]
-    total = sum(f['size_bytes'] for f in files)
+    uid = current_user()
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM files WHERE user_id = ?', (uid,)).fetchall()
+    conn.close()
+    total = sum(r['size_bytes'] or 0 for r in rows)
     limit = 50 * 1024 * 1024
     types = {}
-    for f in files:
-        t = f['type'].split('/')[0]
+    for r in rows:
+        t = (r['mime_type'] or 'other').split('/')[0]
         types[t] = types.get(t, 0) + 1
     return jsonify({
-        'total_files': len(files),
+        'total_files': len(rows),
         'used_bytes': total,
         'limit_bytes': limit,
         'used_percent': round((total / limit) * 100, 1),
